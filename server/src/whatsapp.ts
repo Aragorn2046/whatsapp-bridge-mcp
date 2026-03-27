@@ -164,10 +164,31 @@ export class WhatsAppManager {
         this.phoneNumber = user.id.split(':')[0];
         console.error(`[WhatsApp] Connected as +${this.phoneNumber}`);
       }
+
+      // Pre-load all groups so community sub-groups appear in listChats
+      this.loadAllGroups();
     }
   }
 
-  private handleMessagesUpsert(m: BaileysEventMap['messages.upsert']): void {
+  private async loadAllGroups(): Promise<void> {
+    if (!this.sock) return;
+    try {
+      const groups = await this.sock.groupFetchAllParticipating();
+      for (const [jid, meta] of Object.entries(groups)) {
+        if (!this.recentChats.has(jid)) {
+          this.recentChats.set(jid, {
+            name: meta.subject || jid.split('@')[0],
+            lastTime: meta.subjectTime ? meta.subjectTime * 1000 : 0,
+          });
+        }
+      }
+      console.error(`[WhatsApp] Loaded ${Object.keys(groups).length} groups`);
+    } catch (e) {
+      console.error('[WhatsApp] Failed to load groups:', e);
+    }
+  }
+
+  private async handleMessagesUpsert(m: BaileysEventMap['messages.upsert']): Promise<void> {
     const { messages, type } = m;
 
     for (const msg of messages) {
@@ -176,10 +197,25 @@ export class WhatsAppManager {
 
       // Store chat info
       const pushName = msg.pushName || chatId.split('@')[0];
-      this.recentChats.set(chatId, {
-        name: pushName,
-        lastTime: Date.now(),
-      });
+      // For groups, resolve the group subject instead of using sender's pushName
+      if (chatId.endsWith('@g.us') && this.sock) {
+        try {
+          const existing = this.recentChats.get(chatId);
+          if (!existing || existing.name === pushName || existing.name === chatId.split('@')[0]) {
+            const meta = await this.sock!.groupMetadata(chatId);
+            this.recentChats.set(chatId, {
+              name: meta.subject || pushName,
+              lastTime: Date.now(),
+            });
+          } else {
+            this.recentChats.set(chatId, { name: existing.name, lastTime: Date.now() });
+          }
+        } catch {
+          this.recentChats.set(chatId, { name: pushName, lastTime: Date.now() });
+        }
+      } else {
+        this.recentChats.set(chatId, { name: pushName, lastTime: Date.now() });
+      }
 
       // Skip non-notify messages for reply handling
       if (type !== 'notify') continue;
@@ -367,9 +403,17 @@ export class WhatsAppManager {
       .slice(0, limit);
 
     for (const [id, info] of sorted) {
+      let name = info.name;
+      // Resolve group names that might still show sender pushName
+      if (id.endsWith('@g.us') && this.sock) {
+        try {
+          const meta = await this.sock!.groupMetadata(id);
+          if (meta.subject) name = meta.subject;
+        } catch { /* keep existing name */ }
+      }
       chats.push({
         id,
-        name: info.name,
+        name,
         lastMessageTime: info.lastTime,
         unreadCount: 0,
       });
