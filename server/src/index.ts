@@ -3,11 +3,15 @@
 /**
  * WhatsApp Bridge MCP Server
  *
- * A stdio-based MCP server that lets Claude Code send and receive WhatsApp messages.
+ * Streamable-HTTP MCP server that lets multiple concurrent Claude Code sessions
+ * share one WhatsApp Web session. WhatsApp protocol allows exactly one connection
+ * per phone, so a single persistent bridge owns the session and fans out MCP
+ * tool calls to all connected clients.
  */
 
+import { randomUUID } from 'node:crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { WhatsAppManager } from './whatsapp.js';
 
@@ -345,11 +349,32 @@ async function main() {
     }
   });
 
-  // Connect MCP server via stdio
-  const transport = new StdioServerTransport();
+  // Connect MCP server via streamable HTTP (one shared transport, many clients)
+  const transport = new WebStandardStreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+  });
   await mcpServer.connect(transport);
 
-  console.error('[WhatsApp Bridge] MCP server ready');
+  const host = process.env.WHATSAPP_MCP_HOST ?? '127.0.0.1';
+  const port = parseInt(process.env.WHATSAPP_MCP_PORT ?? '8014', 10);
+
+  Bun.serve({
+    hostname: host,
+    port,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname === '/mcp') {
+        return transport.handleRequest(req);
+      }
+      if (url.pathname === '/healthz') {
+        const status = whatsapp.getAuthStatus();
+        return Response.json({ ok: true, whatsapp: status });
+      }
+      return new Response('Not found', { status: 404 });
+    },
+  });
+
+  console.error(`[WhatsApp Bridge] MCP HTTP server listening on http://${host}:${port}/mcp`);
 
   // Start WhatsApp connection in background (don't block MCP)
   whatsapp.connect().then(() => {
